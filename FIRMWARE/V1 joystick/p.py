@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-Delta robot gamepad controller using pygame.
+Smooth Delta gamepad controller (pygame) — adjustable SPEED variable.
 
-Maps a gamepad's left stick to XY motion and buttons to up/down.
-Sends single-line commands to Arduino (same format as your sketch):
-  - 'w','a','s','d' (letters) for small XY steps (repeat while held)
-  - uppercase letters (W/A/S/D) are treated by Arduino as large steps if you hold shift;
-    here we only send lowercase but you can modify to send uppercase when a modifier button held.
-  - ' ' (a single space + newline) -> UP (Arduino interprets a space-only line)
-  - 'z' -> DOWN
-  - 't' -> type coordinates via console prompt
-  - 'ESC' -> exit (mapped to a button)
+SPEED affects:
+ - XY velocity
+ - Z velocity
+ - update frequency
 """
 
 import sys
@@ -18,25 +13,50 @@ import threading
 import time
 import serial
 import pygame
+import re
 
-# ----- CONFIG -----
-SERIAL_PORT = "COM5"          # <<-- set your serial port
+# ---------------- USER SPEED CONTROL ----------------
+SPEED = 1.0      # 1.0 = normal, 0.5 = slower, 2.0 = faster, 3.0 = very fast
+# -----------------------------------------------------
+
+# ---------------- BASE CONFIG ----------------
+SERIAL_PORT = "COM5"
 BAUDRATE = 115200
-SEND_BASE_INTERVAL = 0.08    # base interval (s) for minimum repeated command when stick at threshold
-DEADZONE = 0.20              # joystick deadzone (0..1)
-MAX_SEND_RATE = 0.01         # shortest delay between sends when stick fully deflected (s)
-AXIS_MAX_MAG = 1.0           # joystick axis magnitude scale
-BUTTON_UP = 0                # button index for UP (A on many controllers)
-BUTTON_DOWN = 1              # button index for DOWN (B)
-BUTTON_PROMPT = 2            # button index for prompt 't' (X)
-BUTTON_EXIT = 3              # button index for exit (Y)
-LEFT_STICK_X = 0             # axis index for left stick X
-LEFT_STICK_Y = 1             # axis index for left stick Y
-INVERT_Y = True              # set True if pushing up gives negative values on your controller (common)
-# ------------------
+
+SEND_INTERVAL_BASE = 0.04     # will be divided by SPEED
+AXIS_MAX_VEL_BASE = 150.0      # mm/s (will be multiplied by SPEED)
+Z_MAX_VEL_BASE = 60.0         # mm/s (will be multiplied by SPEED)
+
+DEADZONE = 0.08
+INVERT_Y = True
+
+# initial estimated position
+estX = 0.0
+estY = 0.0
+estZ = -150.0
+
+# Buttons
+BUTTON_UP = 0
+BUTTON_DOWN = 1
+BUTTON_PROMPT = 2
+BUTTON_EXIT = 3
+
+LEFT_STICK_X = 0
+LEFT_STICK_Y = 1
+# -----------------------------------------------------
+
+# Derived from SPEED
+SEND_INTERVAL = SEND_INTERVAL_BASE / SPEED
+AXIS_MAX_VEL = AXIS_MAX_VEL_BASE * SPEED
+Z_MAX_VEL = Z_MAX_VEL_BASE * SPEED
 
 ser = None
 stop_event = threading.Event()
+pos_lock = threading.Lock()
+
+_est_pos = {"x": estX, "y": estY, "z": estZ}
+
+moved_re = re.compile(r"Moved to:\s*([+-]?\d+(\.\d*)?)\s+([+-]?\d+(\.\d*)?)\s+([+-]?\d+(\.\d*)?)")
 
 def open_serial():
     global ser
@@ -47,148 +67,146 @@ def open_serial():
         ser.reset_input_buffer()
         ser.reset_output_buffer()
     except Exception as e:
-        print(f"[serial] failed open {SERIAL_PORT}: {e}")
+        print("[serial] failed:", e)
         sys.exit(1)
 
 def send_line(s: str):
-    """Send string terminated by newline."""
-    if ser is None:
-        return
     if not s.endswith("\n"):
-        s = s + "\n"
+        s += "\n"
     try:
         ser.write(s.encode("utf-8"))
-    except Exception as e:
-        print(f"[serial] write error: {e}")
+    except:
+        pass
 
 def serial_reader():
-    """Print any lines coming back from Arduino."""
+    global _est_pos
     while not stop_event.is_set():
         try:
-            if ser is None:
-                time.sleep(0.05)
-                continue
             line = ser.readline().decode("utf-8", errors="replace").strip()
             if line:
-                print(f"[arduino] {line}")
-        except Exception:
-            time.sleep(0.05)
-    print("[serial] reader exiting")
+                print("[arduino]", line)
+                m = moved_re.search(line)
+                if m:
+                    try:
+                        x = float(m.group(1))
+                        y = float(m.group(3))
+                        z = float(m.group(5))
+                        with pos_lock:
+                            _est_pos["x"] = x
+                            _est_pos["y"] = y
+                            _est_pos["z"] = z
+                    except:
+                        pass
+        except:
+            time.sleep(0.02)
 
 def prompt_coords():
-    """Prompt user to type absolute coords and send them to Arduino."""
     try:
         s = input("coords> ").strip()
-    except EOFError:
-        return
-    if s:
-        send_line(s)
-        print(f"[sent] {s}")
-
-def clamp(v, a, b):
-    return a if v < a else (b if v > b else v)
+        if s:
+            send_line(s)
+    except:
+        pass
 
 def main():
+    global _est_pos
+
     pygame.init()
     pygame.joystick.init()
 
     if pygame.joystick.get_count() == 0:
-        print("No joystick/gamepad detected. Plug one in and restart.")
+        print("No joystick detected.")
         return
 
-    # Use the first joystick
     joy = pygame.joystick.Joystick(0)
     joy.init()
-    print(f"[joy] Using joystick: {joy.get_name()} (axes={joy.get_numaxes()} buttons={joy.get_numbuttons()})")
+    print("[joy] Controller:", joy.get_name())
 
     open_serial()
 
-    # start serial reader
-    th = threading.Thread(target=serial_reader, daemon=True)
-    th.start()
+    threading.Thread(target=serial_reader, daemon=True).start()
 
-    last_send_time_x = 0.0
-    last_send_time_y = 0.0
-    clock = pygame.time.Clock()
+    up_held = False
+    down_held = False
+
+    last_send = time.time()
+    last_loop = time.time()
+
+    print(f"[info] SPEED = {SPEED}")
+    print(f"[info] XY speed = {AXIS_MAX_VEL} mm/s")
+    print(f"[info] Z speed  = {Z_MAX_VEL} mm/s")
+    print(f"[info] Send interval = {SEND_INTERVAL}s")
+    print("[info] Ready. Use stick for XY, hold A/B for Z, X for coords, Y exit.")
 
     try:
-        print("[info] Gamepad control started. Move left stick to drive XY. Buttons: A->UP, B->DOWN, X->prompt, Y->exit")
         while True:
-            # handle events first (pygame requires pumping events)
+            now = time.time()
+            dt = now - last_loop
+            last_loop = now
+
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     raise KeyboardInterrupt()
+
                 elif ev.type == pygame.JOYBUTTONDOWN:
-                    # map buttons
-                    b = ev.button
-                    if b == BUTTON_UP:
-                        # send a space-only line => Arduino moves UP
-                        send_line(" ")
-                    elif b == BUTTON_DOWN:
-                        send_line("z")
-                    elif b == BUTTON_PROMPT:
-                        # spawn prompt thread so input() doesn't block event loop / joystick handling
+                    if ev.button == BUTTON_UP:
+                        up_held = True
+                    elif ev.button == BUTTON_DOWN:
+                        down_held = True
+                    elif ev.button == BUTTON_PROMPT:
                         threading.Thread(target=prompt_coords, daemon=True).start()
-                    elif b == BUTTON_EXIT:
-                        print("[info] Exit button pressed.")
+                    elif ev.button == BUTTON_EXIT:
                         raise KeyboardInterrupt()
 
-            # read axes
-            ax_x = 0.0
-            ax_y = 0.0
-            try:
-                ax_x = float(joy.get_axis(LEFT_STICK_X))
-            except Exception:
-                ax_x = 0.0
-            try:
-                ax_y = float(joy.get_axis(LEFT_STICK_Y))
-            except Exception:
-                ax_y = 0.0
+                elif ev.type == pygame.JOYBUTTONUP:
+                    if ev.button == BUTTON_UP:
+                        up_held = False
+                    elif ev.button == BUTTON_DOWN:
+                        down_held = False
 
-            # optionally invert Y if needed
+            # joystick axes
+            try:
+                ax = float(joy.get_axis(LEFT_STICK_X))
+                ay = float(joy.get_axis(LEFT_STICK_Y))
+            except:
+                ax = ay = 0.0
+
             if INVERT_Y:
-                ax_y = -ax_y
+                ay = -ay
 
-            # apply deadzone
-            if abs(ax_x) < DEADZONE:
-                ax_x = 0.0
-            if abs(ax_y) < DEADZONE:
-                ax_y = 0.0
+            if abs(ax) < DEADZONE: ax = 0
+            if abs(ay) < DEADZONE: ay = 0
 
-            now = time.time()
-            # map axis magnitude to send interval (more deflection -> smaller delay -> faster repeat)
-            def send_for_axis(axis_val, last_time, negative_cmd, positive_cmd):
-                if axis_val == 0.0:
-                    return last_time
-                mag = clamp(abs(axis_val), 0.0, AXIS_MAX_MAG)
-                # linear interpolation between SEND_BASE_INTERVAL and MAX_SEND_RATE
-                interval = SEND_BASE_INTERVAL - ( (SEND_BASE_INTERVAL - MAX_SEND_RATE) * (mag / AXIS_MAX_MAG) )
-                interval = max(MAX_SEND_RATE, interval)
-                if now - last_time >= interval:
-                    # choose direction based on sign
-                    cmd = positive_cmd if axis_val > 0 else negative_cmd
-                    send_line(cmd)
-                    return now
-                return last_time
+            vx = ax * AXIS_MAX_VEL
+            vy = ay * AXIS_MAX_VEL
+            vz = (Z_MAX_VEL if up_held else -Z_MAX_VEL if down_held else 0)
 
-            last_send_time_x = send_for_axis(ax_x, last_send_time_x, 'a', 'd')  # left->'a', right->'d'
-            last_send_time_y = send_for_axis(ax_y, last_send_time_y, 's', 'w')  # down->'s', up->'w'
+            if now - last_send >= SEND_INTERVAL:
+                with pos_lock:
+                    _est_pos["x"] += vx * (now - last_send)
+                    _est_pos["y"] += vy * (now - last_send)
+                    _est_pos["z"] += vz * (now - last_send)
 
-            # small sleep to avoid busy loop and keep pygame responsive
-            clock.tick(120)  # limit to 120 Hz loop
+                    tx = _est_pos["x"]
+                    ty = _est_pos["y"]
+                    tz = max(-350, min(-10, _est_pos["z"]))  # safety clamp
+
+                    _est_pos["z"] = tz
+
+                send_line(f"{tx:.3f} {ty:.3f} {tz:.3f}")
+                last_send = now
+
+            time.sleep(0.002)
+
     except KeyboardInterrupt:
-        print("[info] quitting...")
+        print("[info] Exiting...")
     finally:
         stop_event.set()
         time.sleep(0.05)
         if ser:
-            try:
-                ser.close()
-            except Exception:
-                pass
+            ser.close()
         pygame.joystick.quit()
         pygame.quit()
-        print("[info] closed.")
 
 if __name__ == "__main__":
     main()
