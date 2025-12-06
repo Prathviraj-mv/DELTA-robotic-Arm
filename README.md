@@ -15,6 +15,7 @@ A 3D printed 3DOF Delta robotic Arm .
 | --------------------------- | --------------------------- |
 
 # Circuit
-<p>
-  <img src ="Images/Screenshot 2025-11-02 134149.png">
-</p>
+
+| <img src="Images/Screenshot 2025-11-02 134149.png">|   <img src="Images/ckt.jpg">|
+| --------------------------- | --------------------------- |
+
