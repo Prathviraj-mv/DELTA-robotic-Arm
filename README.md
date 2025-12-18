@@ -1,8 +1,8 @@
 # DELTA-robotic-Arm
 A 3D printed 3DOF Delta robotic Arm .
 
-| <img src="Images/7b996bd0-bd7c-414e-b474-f9a0e3e04704 (1).jpg">|  
-| --------------------------- | --------------------------- |
+ <img src="Images/7b996bd0-bd7c-414e-b474-f9a0e3e04704 (1).jpg">
+
 
 | <img src="Images/IMG_20251102_135505.jpg">|   <img src="Images/IMG_20251102_135602.jpg">|
 | --------------------------- | --------------------------- |
