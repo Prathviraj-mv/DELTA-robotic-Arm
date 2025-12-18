@@ -9,6 +9,8 @@ A 3D printed 3DOF Delta robotic Arm .
 
 # CAD
  <img src="Images/Screenshot 2025-12-18 080619.png">
+
+ # CAD
 | <img src="Images/Screenshot 2025-10-09 153102.png">|   <img src="Images/Screenshot 2025-10-09 142118.png">|
 | --------------------------- | --------------------------- |
 
